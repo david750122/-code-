@@ -1,0 +1,181 @@
+normalize
+def normalize(value):
+    text = unicodedata.normalize('NFKC', str(value or '')).lower()
+    for a, b in ALIASES.items():
+        text = text.replace(a, b)
+    return re.sub(r'[^\w\u4e00-\u9fff]', '', text)
+grams
+def grams(value):
+    text = normalize(value)
+    return [text[i:i+n] for n in (2, 3) for i in range(len(text)-n+1)] or ([text] if text else [])
+overlap
+def overlap(a, b):
+    a, b = set(grams(a)), set(grams(b))
+    return len(a & b)/len(a | b) if a and b else 0.
+timestamp
+def timestamp(value):
+    if not value:
+        return None
+    try:
+        d = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return d.replace(tzinfo=timezone(timedelta(hours=8))) if d.tzinfo is None else d
+    except (ValueError, TypeError):
+        return None
+features
+def features(a, b):
+    at, bt = timestamp(a.get('occurred_at')), timestamp(b.get('occurred_at'))
+    time_score = math.exp(-abs((at-bt).total_seconds())/2700) if at and bt else 0.
+    ar, br = assertions(a['text']), assertions(b['text'])
+    neg=any(x['category']==y['category'] and ((x['state']=='negative') != (y['state']=='negative')) for x in ar for y in br)
+    av,bv=set(event_labels(a['text']))-{'其他'},set(event_labels(b['text']))-{'其他'}
+    return [overlap(a['text'], b['text']), overlap(a['location'], b['location']), time_score,
+            len(av & bv)/len(av | bv) if av or bv else 0., float(bool(a.get('phone')) and a.get('phone') == b.get('phone')),
+            float(address_conflict(a['location'], b['location'])), float(neg)]
+sigmoid
+def sigmoid(x):
+    return 1/(1+math.exp(-max(-40., min(40., x))))
+Engine.retrieve
+    def retrieve(self, query, k=10):
+        scores = defaultdict(float)
+        n = len(self.records)
+        for term in set(grams(query['text'])):
+            posting = self.postings.get(term, ())
+            idf = math.log(1+(n-len(posting)+.5)/(len(posting)+.5))
+            for i in posting:
+                tf, dl = self.terms[i][term], self.lengths[i]
+                scores[i] += idf*tf*2.2/(tf+1.2*(.25+.75*dl/self.avgdl))
+        lexical = sorted(scores, key=lambda i: (-scores[i], self.records[i]['id']))[:k]
+        # Location route protects paraphrases from lexical-only truncation.
+        qloc=set(grams(query['location']))
+        loc = [(len(qloc & tokens)/len(qloc | tokens) if qloc and tokens else 0., i) for i,tokens in enumerate(self.location_terms)]
+        structural = [i for s,i in sorted(loc, key=lambda x: (-x[0], self.records[x[1]]['id']))[:k] if s >= .15]
+        fused = defaultdict(float)
+        for route in (lexical, structural):
+            for rank, i in enumerate(route, 1):
+                fused[i] += 1/(60+rank)
+        return sorted(fused, key=lambda i: (-fused[i], self.records[i]['id']))[:2*k]
+Engine.analyze
+    def analyze(self, query):
+        candidates = []
+        for i in self.retrieve(query):
+            r = self.records[i]
+            x = features(query, r)
+            parts = [w*v for w,v in zip(self.weights[1:], x)]
+            p = sigmoid(self.weights[0]+sum(parts))
+            candidates.append({'candidate': r, 'score': p, 'features': dict(zip(FEATURES,x)),
+                               'contributions': dict(zip(FEATURES,parts)), 'risk_flags': sorted(risks(query['text'])-risks(r['text'])),
+                               'alarm_evidence':describe_pair(query,r)})
+        candidates.sort(key=lambda c: (-c['score'], c['candidate']['id']))
+        if not candidates:
+            danger = sorted(risks(query['text']))
+            return {'candidate': None, 'score': 0., 'decision':'人工复核' if danger else '独立警情', 'tone':'review' if danger else 'independent', 'risk_flags': danger, 'reasons':['未召回候选，仍须正常受理'], 'candidates': [],
+                    'alarm_evidence':{'new_assertions':assertions(query['text']),'matches':[],'differences':[],'pending':['补充现场位置与发生时间'],'changes':[]}}
+        top = candidates[0]
+        reasons = []
+        f = top['features']
+        if risks(query['text']): reasons.append('存在风险线索')
+        if f['address_conflict']: reasons.append('门牌楼层或出入口冲突')
+        if f['negation_conflict']: reasons.append('否定或风险表述冲突')
+        if not timestamp(query.get('occurred_at')): reasons.append('时间缺失或无效')
+        if len(candidates)>1 and top['score']-candidates[1]['score'] < .08: reasons.append('多个候选得分接近')
+        prediction_set = self.calibration.predict(top['score']) if self.calibration else [0,1]
+        if self.calibration is None: reasons.append('关联依据仍需人工核实')
+        elif len(prediction_set) != 1: reasons.append('现有信息不能形成唯一关联建议')
+        if reasons:
+            decision, tone = '人工复核', 'review'
+        elif prediction_set == [1] and top['score']>=.78:
+            decision, tone = '高概率关联', 'likely'
+        elif prediction_set == [0] and top['score']<.38:
+            decision, tone = '独立警情', 'independent'
+        else:
+            decision, tone = '人工复核', 'review'
+        return {**top, 'decision':decision, 'tone':tone, 'reasons':reasons, 'prediction_set':prediction_set,
+                'risk_flags':sorted(risks(query['text'])), 'new_risk_flags':top['risk_flags'],
+                'calibrated':self.calibration is not None, 'candidates':candidates, 'version':VERSION}
+SplitConformal
+class SplitConformal:
+    """Fixed model, disjoint calibration. Marginal coverage requires exchangeability."""
+    def __init__(self, scores=(), alpha=.1):
+        if not 0 < alpha < 1 or any(not math.isfinite(s) or not 0 <= s <= 1 for s in scores):
+            raise ValueError('invalid calibration')
+        self.n, self.alpha = len(scores), alpha
+        k = math.ceil((self.n+1)*(1-alpha))
+        self.q = sorted(scores)[k-1] if 0 < k <= self.n else float('inf')
+
+    def predict(self, p):
+        return [y for y in (0, 1) if (p if y == 0 else 1-p) <= self.q]
+fit_logistic
+def fit_logistic(rows, epochs=800, lr=.1, l2=.01):
+    """Explicit offline training only. rows = [(feature_vector, binary_label)]."""
+    if len(rows)<2 or set(y for _,y in rows)!={0,1}:
+        raise ValueError('training needs both classes')
+    if any(len(x)!=len(FEATURES) or any(not math.isfinite(v) or not 0<=v<=1 for v in x) for x,_ in rows):
+        raise ValueError('invalid feature vector')
+    w = [0.]*(len(FEATURES)+1)
+    for _ in range(epochs):
+        g = [0.]*len(w)
+        for x,y in rows:
+            v = [1.]+list(x)
+            e = sigmoid(sum(a*b for a,b in zip(w,v)))-y
+            for j in range(len(w)): g[j] += e*v[j]/len(rows)
+        w = [a-lr*(b+(l2*a if j else 0)) for j,(a,b) in enumerate(zip(w,g))]
+    return w
+engineering/information.py
+assertions
+def assertions(text):
+    result=[]
+    # Contrast words split scope even when punctuation is omitted.
+    for match in re.finditer(r'[^，。；,;！？!?]+',text):
+        clause=match.group(); base=match.start()
+        for sub in re.finditer(r'(?:但是|但|不过|然而|随后|现在)?[^但]+',clause):
+            segment=sub.group(); offset=base+sub.start()
+            for category,terms in RISK_LEXICON.items():
+                for term in terms:
+                    for hit in re.finditer(re.escape(term),segment):
+                        prefix=segment[max(0,hit.start()-12):hit.start()]
+                        state='uncertain' if UNCERTAIN.search(prefix) else 'negative' if NEGATIVE.search(prefix) else 'positive'
+                        suffix=segment[hit.end():hit.end()+7]
+                        if re.match(r'(?:情况)?(?:已排除|不存在|已否认)',suffix): state='negative'
+                        historical=bool(PAST.search(prefix))
+                        start=offset+hit.start(); end=offset+hit.end()
+                        result.append(dict(category=category,term=term,state=state,historical=historical,
+                                           start=start,end=end,quote=text[base:match.end()],scope=segment))
+    return sorted(result,key=lambda r:(r['start'],r['category']))
+fact_changes
+def fact_changes(new,old):
+    a,b=assertions(new),assertions(old)
+    states=lambda rows,cat:{r['state'] for r in rows if r['category']==cat}
+    changes=[]
+    for cat in RISK_LEXICON:
+        aa,bb=states(a,cat),states(b,cat)
+        if not aa: continue
+        status='新增线索' if not bb and aa-{'negative'} else '否定转为风险线索' if bb=={'negative'} and aa-{'negative'} else '风险表述变化' if aa!=bb and bb else '持续风险线索' if aa-{'negative'} else '本次未见该风险'
+        changes.append(dict(category=cat,change=status,new=[r for r in a if r['category']==cat],old=[r for r in b if r['category']==cat]))
+    return changes
+address_parts
+def address_parts(text):
+    s=unicodedata.normalize('NFKC',text).replace('二楼','2层').replace('楼层','层')
+    s=re.sub(r'([零一二两三四五六七八九十百千\d]+)(号|栋|幢|楼|层|室)',lambda m:number_cn(m[1])+m[2],s)
+    patterns={'road':r'([\u4e00-\u9fff]{2,12}(?:路|街|大道|巷))', 'number':r'(\d+)号',
+              'building':r'(\d+)(?:栋|幢)', 'floor':r'(\d+)(?:层|楼)', 'room':r'(\d+)室',
+              'gate':r'([东西南北](?:[东西南北])?)门','poi':r'([\u4e00-\u9fff]{2,12}(?:小区|商场|公园|广场|学校|大厦|医院))'}
+    result={k:sorted(set(re.findall(p,s))) for k,p in patterns.items()}
+    result['poi']=sorted(set(v.lstrip('号栋幢楼层') for v in result['poi'] if v.lstrip('号栋幢楼层')))
+    return result
+address_differences
+def address_differences(a,b):
+    aa,bb=address_parts(a),address_parts(b); result=[]
+    labels={'road':'道路','number':'门牌','building':'楼栋','floor':'楼层','room':'房间','gate':'出入口','poi':'场所名称'}
+    for key in labels:
+        agree=bool(set(aa[key])&set(bb[key]))
+        if key in ('road','poi'): agree=any(x.endswith(y) or y.endswith(x) for x in aa[key] for y in bb[key])
+        if aa[key] and bb[key] and not agree:
+            result.append(dict(field=key,label=labels[key],new=aa[key],old=bb[key],
+                               severity='需核对出入口' if key=='gate' else '明确位置差异'))
+    return result
+describe_pair
+def describe_pair(q,c):
+    from .engine import timestamp
+    different=address_differences(q['location'],c['location']); matches=[]; pending=[]
+    qa,ca=address_parts(q['location']),address_parts(c['location'])
+    for key,label in [('road','道路'),('poi','场所'),('number','门牌'),('
